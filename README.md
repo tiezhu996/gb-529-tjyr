@@ -41,6 +41,7 @@ docker compose ps
 - 计量快照：记录液位、液温、汽相压力、密度、不确定度和质量标记；写入时计算罐容、修正密度及液相质量，原值不可覆盖。
 - 物理转移：记录实际流入/流出、时间段、计量质量和物理参考；同一储罐的未取消时间段不得重叠。
 - 平衡运行：选择期初和期末有效快照，汇总期间已确认转移，保存完整输入、系数版本、方程和不确定度证据。
+- 证据冻结校验：计算时在同一事务固化期初/期末快照、期间有效快照集合与已确认转移的 SHA-256 摘要；期间新增快照或确认/取消转移后，列表与详情懒核验并标记证据过期、列出变化来源。过期运行禁止提交或复核，必须重新计算生成独立新结果，旧结果、冻结记录与审计链全部保留；摘要检查与复核状态迁移在同一事务内完成。
 - 独立复核：`queued -> calculating -> pending_review -> accepted | rejected | invalidated`，接受/驳回只允许复核员或管理员。
 - 审计追踪：参数、快照、转移、运行、提交和复核均保存 request ID、操作者及前后摘要。
 - 横切能力：JWT、RBAC、全局错误、结构化访问日志、request ID、panic recovery、本地令牌桶限流和优雅停机。
@@ -137,6 +138,12 @@ docker compose ps
 - 后端常量、算法与 service：`backend/internal/constants/deviation.go`、`backend/internal/balance/uncertainty.go`、`backend/internal/service/balance_run.go`
 - 前端类型、共享组件和页面：`frontend/src/types/deviation.ts`、`frontend/src/types/balance.ts`、`frontend/src/components/common/EvidenceBreakdownPanel.tsx`、`frontend/src/components/common/MassBalanceWaterfall.tsx`、`frontend/src/pages/BalancesPage.tsx`
 
+`EvidenceFreezeStatus = frozen | stale`（证据冻结/过期，随平衡运行列表与详情返回 `freeze_status`、`stale_reason`、`freeze_changes`、`frozen_at`、`freeze_checked_at`）：
+
+- 数据库/model：`backend/internal/model/balance_freeze.go`（`balance_evidence_freezes` 表）、`backend/internal/model/balance_run.go`
+- 后端仓库、服务、处理器：`backend/internal/repository/freeze_evidence.go`、`backend/internal/repository/balance_run.go`、`backend/internal/service/balance_run.go`、`backend/internal/handler/balance_run.go`
+- 前端类型、共享组件和页面：`frontend/src/types/balance.ts`、`frontend/src/components/common/EvidenceFreezeBanner.tsx`、`frontend/src/components/common/EvidenceBreakdownPanel.tsx`、`frontend/src/pages/BalancesPage.tsx`
+
 ## 环境变量与端口
 
 | 变量 | 默认示例 | 说明 |
@@ -191,6 +198,7 @@ node scripts/api-smoke.mjs
 - `CLOSING_SNAPSHOT_MISSING`：期间内没有晚于期初的有效期末快照。
 - `TRANSFER_TIME_OVERLAP`：同一储罐已有时间重叠且未取消的物理转移。
 - `TANK_VERSION_CONFLICT` / `BALANCE_VERSION_CONFLICT`：数据被其他请求更新，刷新后使用新版本重试。
+- `BALANCE_EVIDENCE_STALE`：运行固化的证据摘要（期初/期末快照、期间快照集合、已确认转移）已与当前数据不一致；提交或复核被拒绝，请重新运行平衡生成独立新结果。作废过期运行仍允许执行，旧结果和审计保留。变化来源见运行详情中的 `freeze_changes`（`opening_snapshot`/`closing_snapshot`/`snapshot_added`/`transfer_confirmed`/`transfer_unlocked`）。
 - 后端未 healthy：运行 `docker compose logs backend`，检查 JWT、数据库配置和 PostgreSQL 健康状态。
 - 前端 API 失败：确认 Nginx 的 `/api/` 使用无尾斜杠的 `proxy_pass http://backend:8080`，避免剥离 `/api`。
 

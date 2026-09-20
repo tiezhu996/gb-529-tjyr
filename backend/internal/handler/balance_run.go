@@ -23,8 +23,12 @@ func NewBalanceHandler(balanceService *service.BalanceService) *BalanceHandler {
 func (h *BalanceHandler) List(c *gin.Context) {
 	page, pageSize := pagination(c)
 	tankID, _ := strconv.ParseUint(c.Query("tank_id"), 10, 32)
+	actor, ok := actorFromContext(c)
+	if !ok {
+		return
+	}
 	filter := repository.BalanceFilter{TankID: uint(tankID), Status: c.Query("status"), Page: page, PageSize: pageSize}
-	items, total, err := h.service.List(c.Request.Context(), filter)
+	items, total, err := h.service.List(c.Request.Context(), filter, actor)
 	if err != nil {
 		api.Fail(c, err)
 		return
@@ -37,7 +41,11 @@ func (h *BalanceHandler) Get(c *gin.Context) {
 	if !ok {
 		return
 	}
-	item, err := h.service.Get(c.Request.Context(), id)
+	actor, ok := actorFromContext(c)
+	if !ok {
+		return
+	}
+	item, err := h.service.Get(c.Request.Context(), id, actor)
 	if err != nil {
 		api.Fail(c, err)
 		return

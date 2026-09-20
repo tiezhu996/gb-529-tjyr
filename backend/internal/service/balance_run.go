@@ -31,15 +31,100 @@ func NewBalanceService(repo *repository.BalanceRepository, tankRepo *repository.
 	return &BalanceService{repo: repo, tankRepo: tankRepo, measurementRepo: measurementRepo, transferRepo: transferRepo}
 }
 
-func (s *BalanceService) List(ctx context.Context, filter repository.BalanceFilter) ([]model.BalanceRun, int64, error) {
+func (s *BalanceService) List(ctx context.Context, filter repository.BalanceFilter, actor repository.Actor) ([]model.BalanceRun, int64, error) {
 	if filter.Status != "" && !constants.ValidBalanceStatus(constants.BalanceStatus(filter.Status)) {
 		return nil, 0, api.NewError(400, "INVALID_BALANCE_STATUS", "平衡状态筛选值无效")
 	}
-	return s.repo.List(ctx, filter)
+	runs, total, err := s.repo.List(ctx, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := s.enrichWithFreezeStatus(ctx, runs, actor); err != nil {
+		return nil, 0, err
+	}
+	return runs, total, nil
 }
 
-func (s *BalanceService) Get(ctx context.Context, id uint) (model.BalanceRun, error) {
-	return s.repo.Get(ctx, id)
+func (s *BalanceService) Get(ctx context.Context, id uint, actor repository.Actor) (model.BalanceRun, error) {
+	run, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return model.BalanceRun{}, err
+	}
+	runs := []model.BalanceRun{run}
+	if err := s.enrichWithFreezeStatus(ctx, runs, actor); err != nil {
+		return model.BalanceRun{}, err
+	}
+	return runs[0], nil
+}
+
+// freezeView 是一次请求内懒核验得到的冻结视图，仅用于装饰 API 响应，不落 balance_runs 表。
+type freezeView struct {
+	Status      model.EvidenceFreezeStatus
+	Changes     []model.FreezeChangeSource
+	StaleReason string
+	FrozenAt    *time.Time
+	CheckedAt   *time.Time
+}
+
+// enrichWithFreezeStatus 在列表/详情读取时做一次证据懒核验：
+// 重新计算期初、期末快照与期间已确认转移摘要，标记冻结/过期状态并列出变化来源，
+// 核验出的状态漂移一次性持久化，供提交/复核事务与列表展示使用同一结论。
+func (s *BalanceService) enrichWithFreezeStatus(ctx context.Context, runs []model.BalanceRun, actor repository.Actor) error {
+	if len(runs) == 0 {
+		return nil
+	}
+	runIDs := make([]uint, 0, len(runs))
+	for _, run := range runs {
+		runIDs = append(runIDs, run.ID)
+	}
+	freezes, err := s.repo.ListFreezesByRunIDs(ctx, runIDs)
+	if err != nil {
+		return err
+	}
+	if len(freezes) == 0 {
+		return nil
+	}
+	freezeList := make([]model.BalanceEvidenceFreeze, 0, len(freezes))
+	for _, freeze := range freezes {
+		freezeList = append(freezeList, freeze)
+	}
+	contexts, err := s.repo.LoadFreezeContexts(ctx, freezeList)
+	if err != nil {
+		return err
+	}
+	evaluations := make(map[uint]repository.FreezeEvaluation, len(freezeList))
+	views := make(map[uint]freezeView, len(freezeList))
+	for _, freeze := range freezeList {
+		evaluation, err := repository.EvaluateFreeze(freeze, contexts[freeze.BalanceRunID])
+		if err != nil {
+			return err
+		}
+		evaluations[freeze.BalanceRunID] = evaluation
+		frozenAt := freeze.FrozenAt.UTC()
+		checkedAt := freeze.CheckedAt.UTC()
+		views[freeze.BalanceRunID] = freezeView{
+			Status:      evaluation.Status,
+			Changes:     evaluation.Changes,
+			StaleReason: evaluation.StaleReason,
+			FrozenAt:    &frozenAt,
+			CheckedAt:   &checkedAt,
+		}
+	}
+	if err := s.repo.PersistFreezeEvaluations(ctx, freezes, evaluations, actor); err != nil {
+		return err
+	}
+	for index := range runs {
+		view, ok := views[runs[index].ID]
+		if !ok {
+			continue
+		}
+		runs[index].FreezeStatus = view.Status
+		runs[index].FreezeChanges = view.Changes
+		runs[index].StaleReason = view.StaleReason
+		runs[index].FrozenAt = view.FrozenAt
+		runs[index].FreezeCheckedAt = view.CheckedAt
+	}
+	return nil
 }
 
 func (s *BalanceService) Run(ctx context.Context, request dto.RunBalanceRequest, actor repository.Actor) (model.BalanceRun, error) {
@@ -67,6 +152,10 @@ func (s *BalanceService) Run(ctx context.Context, request dto.RunBalanceRequest,
 	if err != nil {
 		return model.BalanceRun{}, err
 	}
+	periodSnapshots, err := s.measurementRepo.ValidSnapshotsInPeriod(ctx, tank.ID, start, end)
+	if err != nil {
+		return model.BalanceRun{}, err
+	}
 	transfers, err := s.transferRepo.ConfirmedForPeriod(ctx, tank.ID, start, end)
 	if err != nil {
 		return model.BalanceRun{}, err
@@ -74,6 +163,13 @@ func (s *BalanceService) Run(ctx context.Context, request dto.RunBalanceRequest,
 	calculation, snapshotJSON, evidenceJSON, err := calculateBalanceRun(tank, opening, closing, transfers, start, end)
 	if err != nil {
 		return model.BalanceRun{}, err
+	}
+	// 计算时刻固化期初、期末快照与期间已确认转移的独立摘要；
+	// 该摘要与运行结果在同一事务落库，旧运行永不覆盖，重新计算只会产生独立新结果。
+	frozenAt := time.Now().UTC()
+	freeze, err := repository.BuildEvidenceFreeze(tank.ID, start, end, opening, closing, periodSnapshots, transfers, frozenAt)
+	if err != nil {
+		return model.BalanceRun{}, fmt.Errorf("freeze balance evidence: %w", err)
 	}
 	run := model.BalanceRun{
 		TankID:             tank.ID,
@@ -95,10 +191,13 @@ func (s *BalanceService) Run(ctx context.Context, request dto.RunBalanceRequest,
 		Version:            2,
 		CreatedBy:          actor.UserID,
 	}
-	if err := s.repo.CreateCalculated(ctx, &run, actor); err != nil {
+	if err := s.repo.CreateCalculated(ctx, &run, &freeze, actor); err != nil {
 		return model.BalanceRun{}, err
 	}
 	run.Tank = &tank
+	run.FreezeStatus = model.EvidenceFreezeFrozen
+	run.FrozenAt = &freeze.FrozenAt
+	run.FreezeCheckedAt = &freeze.CheckedAt
 	return run, nil
 }
 

@@ -1,7 +1,8 @@
 import { Alert, Descriptions, Table, Tag } from 'antd'
 import type { BalanceRun, UncertaintyComponent } from '../../types/balance'
+import { EvidenceFreezeTag } from './EvidenceFreezeBanner'
 import { deviationLabels } from '../../types/deviation'
-import { kg, number } from '../../utils/format'
+import { dateTime, kg, number } from '../../utils/format'
 
 const sourceLabels: Record<string, string> = {
   opening_snapshot: '期初快照',
@@ -30,6 +31,12 @@ export function EvidenceBreakdownPanel({ run }: { run?: BalanceRun }) {
         <Descriptions.Item label="系数版本">{run.coefficient_version}</Descriptions.Item>
         <Descriptions.Item label="合成不确定度">{kg(run.uncertainty_kg)}</Descriptions.Item>
         <Descriptions.Item label="偏差">{number.format(run.deviation_pct)}%</Descriptions.Item>
+        <Descriptions.Item label="证据冻结" span={2}>
+          {run.freeze_status ? <EvidenceFreezeTag run={run} /> : <Tag>未固化</Tag>}
+        </Descriptions.Item>
+        <Descriptions.Item label="固化时间" span={2}>
+          {run.frozen_at ? dateTime(run.frozen_at) : '—'}
+        </Descriptions.Item>
       </Descriptions>
       {uncertainty?.components?.length ? (
         <Table<UncertaintyComponent>

@@ -82,6 +82,13 @@ func (r *TransferRepository) Create(ctx context.Context, item *model.TransferOpe
 		if err := tx.Create(item).Error; err != nil {
 			return fmt.Errorf("create transfer operation: %w", err)
 		}
+		// 直接以 confirmed 登记的转移同样改变期间已确认转移摘要，同事务标记固化证据；
+		// 懒核验是状态真相来源，这里仅让列表标记即时反映。
+		if item.OperationStatus == "confirmed" {
+			if err := markEvidenceStaleForTransfer(tx, *item); err != nil {
+				return fmt.Errorf("mark frozen evidence stale for confirmed transfer creation: %w", err)
+			}
+		}
 		audit := NewAudit(actor, "transfer_operation.created", "transfer_operation", item.ID, nil, item)
 		if err := tx.Create(&audit).Error; err != nil {
 			return fmt.Errorf("audit transfer operation: %w", err)
@@ -121,6 +128,13 @@ func (r *TransferRepository) Transition(ctx context.Context, id, version uint, t
 		}
 		if err := tx.First(&updated, id).Error; err != nil {
 			return fmt.Errorf("reload transfer operation: %w", err)
+		}
+		// 确认/取消转移会改变期间“已确认转移”摘要，同事务标记窗口重叠的固化证据；
+		// 懒核验负责列出具体新增确认或被取消的转移来源。
+		if target == "confirmed" || target == "cancelled" {
+			if err := markEvidenceStaleForTransfer(tx, updated); err != nil {
+				return fmt.Errorf("mark frozen evidence stale for transfer transition: %w", err)
+			}
 		}
 		audit := NewAudit(actor, "transfer_operation."+target, "transfer_operation", id, before, map[string]any{"record": updated, "reason": reason})
 		if err := tx.Create(&audit).Error; err != nil {

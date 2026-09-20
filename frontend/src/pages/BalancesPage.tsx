@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Alert, Button, Form, Input, Modal, Select, Table, Tag } from 'antd'
 import { CheckCircle2, Play, RefreshCw, Send, XCircle } from 'lucide-react'
 import { EvidenceBreakdownPanel } from '../components/common/EvidenceBreakdownPanel'
+import { EvidenceFreezeBanner, EvidenceFreezeTag, isStaleRun } from '../components/common/EvidenceFreezeBanner'
 import { MassBalanceWaterfall } from '../components/common/MassBalanceWaterfall'
 import { PageHeader } from '../components/common/PageHeader'
 import { useAuth } from '../hooks/useAuth'
@@ -70,6 +71,7 @@ export function BalancesPage() {
               {selected && <Tag color={selected.deviation_level === 'investigate' ? 'warning' : 'success'}>{deviationLabels[selected.deviation_level]}</Tag>}
             </div>
             <MassBalanceWaterfall run={selected} />
+            {selected && <EvidenceFreezeBanner run={selected} />}
             {selected && (
               <div className="metric-strip">
                 <div><span>BOG / 未解释项</span><strong>{kg(selected.estimated_bog_kg)}</strong></div>
@@ -93,17 +95,34 @@ export function BalancesPage() {
             rowClassName={(item) => item.id === selected?.id ? 'selected-row' : ''}
             columns={[
               { title: '运行', key: 'run', render: (_, item) => <><strong>#{item.id} · {item.tank?.tank_code ?? item.tank_id}</strong><div className="secondary">{dateTime(item.period_end)}</div></> },
-              { title: '状态', dataIndex: 'balance_status', width: 92, render: (value: BalanceStatus) => <Tag>{statusLabels[value]}</Tag> }
+              { title: '状态', dataIndex: 'balance_status', width: 92, render: (value: BalanceStatus) => <Tag>{statusLabels[value]}</Tag> },
+              {
+                title: '证据', key: 'evidence', width: 96,
+                render: (_, item) => item.freeze_status ? <EvidenceFreezeTag run={item} /> : <span className="secondary">—</span>
+              }
             ]}
           />
           {selected && (
             <div className="workflow-actions">
-              {selected.balance_status === 'calculating' && can('process_analyst', 'admin') && <Button type="primary" icon={<Send size={16} />} loading={store.working} onClick={() => void store.submit(selected)} block>提交独立复核</Button>}
+              {selected.balance_status === 'calculating' && can('process_analyst', 'admin') && (
+                <Button type="primary" icon={<Send size={16} />} loading={store.working} disabled={isStaleRun(selected)}
+                  title={isStaleRun(selected) ? '证据已过期，必须重新计算后再提交' : undefined}
+                  onClick={() => void store.submit(selected)} block>
+                  {isStaleRun(selected) ? '证据过期，禁止提交复核' : '提交独立复核'}
+                </Button>
+              )}
               {selected.balance_status === 'pending_review' && can('reviewer', 'admin') && (
                 <>
-                  <Button type="primary" icon={<CheckCircle2 size={16} />} onClick={() => openReview('accepted')} block>接受结果</Button>
-                  <Button danger icon={<XCircle size={16} />} onClick={() => openReview('rejected')} block>驳回结果</Button>
+                  <Button type="primary" icon={<CheckCircle2 size={16} />} disabled={isStaleRun(selected)}
+                    title={isStaleRun(selected) ? '证据已过期，必须重新计算后再复核' : undefined}
+                    onClick={() => openReview('accepted')} block>接受结果</Button>
+                  <Button danger icon={<XCircle size={16} />} disabled={isStaleRun(selected)}
+                    title={isStaleRun(selected) ? '证据已过期，必须重新计算后再复核' : undefined}
+                    onClick={() => openReview('rejected')} block>驳回结果</Button>
                 </>
+              )}
+              {isStaleRun(selected) && (
+                <Alert type="warning" showIcon message="证据已过期：请使用相同期间重新运行平衡，系统将生成独立的新结果，本运行及其审计链保留不变。" />
               )}
               {selected.review_note && <Alert type="info" showIcon message={selected.review_note} />}
             </div>

@@ -81,6 +81,11 @@ func (r *MeasurementRepository) Create(ctx context.Context, snapshot *model.Meas
 		if err := tx.Create(snapshot).Error; err != nil {
 			return fmt.Errorf("create immutable measurement snapshot: %w", err)
 		}
+		// 新增快照可能改变后续平衡运行的边界选择或期间证据集合，同事务保守标过期，
+		// 真实变化来源在列表/详情懒核验时列出；误标会在下次读取核验时自愈为 frozen。
+		if err := markEvidenceStaleForSnapshot(tx, *snapshot); err != nil {
+			return fmt.Errorf("mark frozen evidence stale for new snapshot: %w", err)
+		}
 		audit := NewAudit(actor, "measurement_snapshot.created", "measurement_snapshot", snapshot.ID, nil, snapshot)
 		if err := tx.Create(&audit).Error; err != nil {
 			return fmt.Errorf("audit measurement snapshot: %w", err)
@@ -120,6 +125,19 @@ func (r *MeasurementRepository) ListForTank(ctx context.Context, tankID uint) ([
 	var snapshots []model.MeasurementSnapshot
 	if err := r.db.WithContext(ctx).Where("tank_id = ?", tankID).Order("measured_at ASC").Find(&snapshots).Error; err != nil {
 		return nil, fmt.Errorf("list tank measurement history: %w", err)
+	}
+	return snapshots, nil
+}
+
+// ValidSnapshotsInPeriod 返回期间内（开始时间之后、结束时间之前，含结束时点）的有效快照，
+// 用于固化“期间快照集合”摘要，从而在期间新增快照时识别证据过期来源。
+func (r *MeasurementRepository) ValidSnapshotsInPeriod(ctx context.Context, tankID uint, periodStart, periodEnd time.Time) ([]model.MeasurementSnapshot, error) {
+	var snapshots []model.MeasurementSnapshot
+	if err := r.db.WithContext(ctx).
+		Where("tank_id = ? AND measured_at > ? AND measured_at <= ? AND quality_flag <> ?",
+			tankID, periodStart.UTC(), periodEnd.UTC(), constants.QualityInvalid).
+		Order("measured_at ASC, id ASC").Find(&snapshots).Error; err != nil {
+		return nil, fmt.Errorf("list valid snapshots in balance period: %w", err)
 	}
 	return snapshots, nil
 }

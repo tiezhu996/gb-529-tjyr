@@ -3,6 +3,16 @@ import type { StorageTank } from './tank'
 
 export type BalanceStatus = 'queued' | 'calculating' | 'pending_review' | 'accepted' | 'rejected' | 'invalidated'
 
+export type EvidenceFreezeStatus = 'frozen' | 'stale'
+
+export interface FreezeChangeSource {
+  kind: 'opening_snapshot' | 'closing_snapshot' | 'snapshot_added' | 'transfer_confirmed' | 'transfer_unlocked' | string
+  entity_type: string
+  entity_id: number
+  message: string
+  occurred_at?: string
+}
+
 export interface BalanceRun {
   id: number
   tank_id: number
@@ -29,6 +39,11 @@ export interface BalanceRun {
   created_at: string
   updated_at: string
   tank?: StorageTank
+  freeze_status?: EvidenceFreezeStatus
+  stale_reason?: string
+  freeze_changes?: FreezeChangeSource[]
+  frozen_at?: string
+  freeze_checked_at?: string
 }
 
 export interface UncertaintyComponent {
