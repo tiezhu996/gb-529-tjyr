@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Alert, Button, Form, Input, Modal, Select, Table, Tag } from 'antd'
-import { CheckCircle2, Play, RefreshCw, Send, XCircle } from 'lucide-react'
+import { Alert, Button, Form, Input, Modal, Select, Table, Tag, Tooltip } from 'antd'
+import { CheckCircle2, Play, RefreshCw, Send, Snowflake, TriangleAlert, XCircle } from 'lucide-react'
 import { EvidenceBreakdownPanel } from '../components/common/EvidenceBreakdownPanel'
+import { EvidenceFreezePanel } from '../components/common/EvidenceFreezePanel'
 import { MassBalanceWaterfall } from '../components/common/MassBalanceWaterfall'
 import { PageHeader } from '../components/common/PageHeader'
 import { useAuth } from '../hooks/useAuth'
@@ -75,10 +76,25 @@ export function BalancesPage() {
                 <div><span>BOG / 未解释项</span><strong>{kg(selected.estimated_bog_kg)}</strong></div>
                 <div><span>不确定度</span><strong>± {kg(selected.uncertainty_kg)}</strong></div>
                 <div><span>偏差率</span><strong>{number.format(selected.deviation_pct)}%</strong></div>
-                <div><span>状态</span><strong>{statusLabels[selected.balance_status]}</strong></div>
+                <div>
+                  <span>证据冻结</span>
+                  <strong className={selected.evidence_stale ? 'stale-text' : 'frozen-text'}>
+                    {selected.evidence_stale ? <><TriangleAlert size={14} /> 证据过期</> : <><Snowflake size={14} /> 冻结一致</>}
+                  </strong>
+                </div>
               </div>
             )}
+            {selected?.evidence_stale && (
+              <Alert
+                className="freeze-inline-alert"
+                type="error"
+                showIcon
+                icon={<TriangleAlert size={16} />}
+                message="该运行的期初/期末快照或期间已确认转移已变化，结果证据过期；提交与复核已锁定，请重新运行平衡生成独立结果，旧结果与审计继续保留。"
+              />
+            )}
           </div>
+          <EvidenceFreezePanel run={selected} />
           <EvidenceBreakdownPanel run={selected} />
         </div>
         <aside className="run-rail">
@@ -90,19 +106,64 @@ export function BalancesPage() {
             dataSource={store.items}
             pagination={{ pageSize: 8, showSizeChanger: false }}
             onRow={(item) => ({ onClick: () => store.select(item.id) })}
-            rowClassName={(item) => item.id === selected?.id ? 'selected-row' : ''}
+            rowClassName={(item) => [
+              item.id === selected?.id ? 'selected-row' : '',
+              item.evidence_stale ? 'stale-row' : ''
+            ].filter(Boolean).join(' ')}
             columns={[
-              { title: '运行', key: 'run', render: (_, item) => <><strong>#{item.id} · {item.tank?.tank_code ?? item.tank_id}</strong><div className="secondary">{dateTime(item.period_end)}</div></> },
-              { title: '状态', dataIndex: 'balance_status', width: 92, render: (value: BalanceStatus) => <Tag>{statusLabels[value]}</Tag> }
+              {
+                title: '运行', key: 'run',
+                render: (_, item) => (
+                  <>
+                    <strong>#{item.id} · {item.tank?.tank_code ?? item.tank_id}</strong>
+                    <div className="secondary">{dateTime(item.period_end)}</div>
+                    {item.evidence_stale && (
+                      <Tag className="stale-inline-tag" color="error" icon={<TriangleAlert size={11} />}>
+                        证据过期 · {(item.stale_changes ?? []).length} 项变化
+                      </Tag>
+                    )}
+                  </>
+                )
+              },
+              {
+                title: '状态', dataIndex: 'balance_status', width: 104,
+                render: (value: BalanceStatus, item) => (
+                  <span className="rail-status-cell">
+                    <Tag>{statusLabels[value]}</Tag>
+                    <Tooltip title={item.evidence_stale ? '冻结证据与当前期间不一致' : '冻结证据与当前期间一致'}>
+                      {item.evidence_stale
+                        ? <TriangleAlert size={14} className="stale-icon" aria-label="证据过期" />
+                        : <Snowflake size={14} className="frozen-icon" aria-label="冻结一致" />}
+                    </Tooltip>
+                  </span>
+                )
+              }
             ]}
           />
           {selected && (
             <div className="workflow-actions">
-              {selected.balance_status === 'calculating' && can('process_analyst', 'admin') && <Button type="primary" icon={<Send size={16} />} loading={store.working} onClick={() => void store.submit(selected)} block>提交独立复核</Button>}
+              {selected.evidence_stale && (selected.balance_status === 'calculating' || selected.balance_status === 'pending_review') && (
+                <Alert
+                  type="error"
+                  showIcon
+                  icon={<TriangleAlert size={15} />}
+                  message="证据过期，提交与复核已锁定"
+                  description={(selected.stale_changes ?? []).map((change) => change.detail).join('；') || '请重新运行平衡生成独立结果。'}
+                />
+              )}
+              {selected.balance_status === 'calculating' && can('process_analyst', 'admin') && (
+                <Tooltip title={selected.evidence_stale ? '证据已过期，必须重新计算生成独立结果' : '提交当前冻结证据给独立复核员'}>
+                  <Button type="primary" icon={<Send size={16} />} loading={store.working} disabled={selected.evidence_stale} onClick={() => void store.submit(selected)} block>提交独立复核</Button>
+                </Tooltip>
+              )}
               {selected.balance_status === 'pending_review' && can('reviewer', 'admin') && (
                 <>
-                  <Button type="primary" icon={<CheckCircle2 size={16} />} onClick={() => openReview('accepted')} block>接受结果</Button>
-                  <Button danger icon={<XCircle size={16} />} onClick={() => openReview('rejected')} block>驳回结果</Button>
+                  <Tooltip title={selected.evidence_stale ? '证据已过期，不允许接受，请退回分析员重新计算' : '冻结证据一致，可以接受结果'}>
+                    <Button type="primary" icon={<CheckCircle2 size={16} />} disabled={selected.evidence_stale} onClick={() => openReview('accepted')} block>接受结果</Button>
+                  </Tooltip>
+                  <Tooltip title={selected.evidence_stale ? '证据已过期，请由分析员重新计算生成独立结果' : '冻结证据存在疑问时驳回结果'}>
+                    <Button danger icon={<XCircle size={16} />} disabled={selected.evidence_stale} onClick={() => openReview('rejected')} block>驳回结果</Button>
+                  </Tooltip>
                 </>
               )}
               {selected.review_note && <Alert type="info" showIcon message={selected.review_note} />}

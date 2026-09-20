@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -33,7 +34,7 @@ func TestCalculateBalanceRunProducesReplayEvidence(t *testing.T) {
 		{ID: 20, OperationType: "inflow", MeasuredMassKG: 250000, MeasurementUncertaintyPct: 0.2},
 		{ID: 21, OperationType: "outflow", MeasuredMassKG: 90000, MeasurementUncertaintyPct: 0.25},
 	}
-	calculated, snapshot, evidence, err := calculateBalanceRun(tank, opening, closing, transfers, start, end)
+	calculated, snapshot, evidence, frozen, err := calculateBalanceRun(tank, opening, closing, transfers, start, end)
 	if err != nil {
 		t.Fatalf("calculate run: %v", err)
 	}
@@ -42,6 +43,12 @@ func TestCalculateBalanceRunProducesReplayEvidence(t *testing.T) {
 	}
 	if len(snapshot) < 200 || len(evidence) < 200 {
 		t.Fatalf("expected replay snapshot and evidence, got %d/%d bytes", len(snapshot), len(evidence))
+	}
+	if len(frozen) < 200 {
+		t.Fatalf("expected frozen evidence manifest, got %d bytes", len(frozen))
+	}
+	if !strings.Contains(string(frozen), "evidence-freeze-v1") {
+		t.Fatalf("frozen manifest missing freeze version: %s", string(frozen))
 	}
 	if calculated.DeviationLevel != constants.DeviationWithinUncertainty {
 		t.Fatalf("unexpected deviation level: %s", calculated.DeviationLevel)

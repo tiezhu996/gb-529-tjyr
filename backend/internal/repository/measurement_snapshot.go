@@ -85,6 +85,11 @@ func (r *MeasurementRepository) Create(ctx context.Context, snapshot *model.Meas
 		if err := tx.Create(&audit).Error; err != nil {
 			return fmt.Errorf("audit measurement snapshot: %w", err)
 		}
+		// 期间新增快照会改变已有非终态运行的期初/期末边界选择，
+		// 在同一事务内重放冻结摘要并标记证据过期，审计随快照创建一并提交。
+		if err := markRunsStaleFromSnapshot(tx, snapshot.TankID, time.Now().UTC(), actor); err != nil {
+			return err
+		}
 		return nil
 	})
 }

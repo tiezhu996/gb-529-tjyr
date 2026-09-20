@@ -41,8 +41,9 @@ docker compose ps
 - 计量快照：记录液位、液温、汽相压力、密度、不确定度和质量标记；写入时计算罐容、修正密度及液相质量，原值不可覆盖。
 - 物理转移：记录实际流入/流出、时间段、计量质量和物理参考；同一储罐的未取消时间段不得重叠。
 - 平衡运行：选择期初和期末有效快照，汇总期间已确认转移，保存完整输入、系数版本、方程和不确定度证据。
-- 独立复核：`queued -> calculating -> pending_review -> accepted | rejected | invalidated`，接受/驳回只允许复核员或管理员。
-- 审计追踪：参数、快照、转移、运行、提交和复核均保存 request ID、操作者及前后摘要。
+- 证据冻结校验：计算时在同一事务固化期初/期末快照与期间已确认转移的 SHA-256 摘要（`evidence-freeze-v1`）；期间新增快照或确认/取消转移后，非终态运行在同一事务标记证据过期并记录变化来源；过期运行不得提交或复核（`EVIDENCE_STALE`），必须重新运行生成独立结果，旧结果与审计链完整保留；摘要检查与复核状态迁移在同一事务完成。
+- 独立复核：`queued -> calculating -> pending_review -> accepted | rejected | invalidated`，接受/驳回只允许复核员或管理员。终态结果的冻结清单只作历史重放，不再被实时证据判定。
+- 审计追踪：参数、快照、转移、运行、提交、证据过期标记和复核均保存 request ID、操作者及前后摘要。
 - 横切能力：JWT、RBAC、全局错误、结构化访问日志、request ID、panic recovery、本地令牌桶限流和优雅停机。
 
 ## 计算方法与单位
@@ -128,8 +129,8 @@ docker compose ps
 `BalanceStatus = queued | calculating | pending_review | accepted | rejected | invalidated`：
 
 - 数据库/model：`backend/internal/model/balance_run.go`
-- 后端常量、DTO、repository、service、handler、router：`backend/internal/constants/balance.go`、`backend/internal/dto/balance_run.go`、`backend/internal/repository/balance_run.go`、`backend/internal/service/balance_run.go`、`backend/internal/handler/balance_run.go`、`backend/internal/router/router.go`
-- 前端类型、API、store、hook、组件和页面：`frontend/src/types/balance.ts`、`frontend/src/api/balances.ts`、`frontend/src/stores/balanceStore.ts`、`frontend/src/hooks/useBalanceRun.ts`、`frontend/src/components/common/EvidenceBreakdownPanel.tsx`、`frontend/src/pages/BalancesPage.tsx`
+- 后端常量、DTO、repository、service、handler、router：`backend/internal/constants/balance.go`、`backend/internal/dto/balance_run.go`、`backend/internal/model/balance_run.go`、`backend/internal/repository/balance_run.go`、`backend/internal/repository/measurement_snapshot.go`、`backend/internal/repository/transfer_operation.go`、`backend/internal/service/balance_run.go`、`backend/internal/handler/balance_run.go`、`backend/internal/router/router.go`
+- 前端类型、API、store、hook、组件和页面：`frontend/src/types/balance.ts`、`frontend/src/api/balances.ts`、`frontend/src/stores/balanceStore.ts`、`frontend/src/hooks/useBalanceRun.ts`、`frontend/src/components/common/EvidenceBreakdownPanel.tsx`、`frontend/src/components/common/EvidenceFreezePanel.tsx`、`frontend/src/pages/BalancesPage.tsx`
 
 `DeviationLevel = within_uncertainty | watch | investigate | invalid`：
 

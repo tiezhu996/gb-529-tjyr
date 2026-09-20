@@ -35,11 +35,31 @@ func (s *BalanceService) List(ctx context.Context, filter repository.BalanceFilt
 	if filter.Status != "" && !constants.ValidBalanceStatus(constants.BalanceStatus(filter.Status)) {
 		return nil, 0, api.NewError(400, "INVALID_BALANCE_STATUS", "平衡状态筛选值无效")
 	}
-	return s.repo.List(ctx, filter)
+	runs, total, err := s.repo.List(ctx, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	states, err := repository.LoadEvidenceStates(ctx, s.repo.DB(), runs)
+	if err != nil {
+		return nil, 0, err
+	}
+	for index := range runs {
+		applyEvidenceState(&runs[index], states[runs[index].ID])
+	}
+	return runs, total, nil
 }
 
 func (s *BalanceService) Get(ctx context.Context, id uint) (model.BalanceRun, error) {
-	return s.repo.Get(ctx, id)
+	run, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return model.BalanceRun{}, err
+	}
+	states, err := repository.LoadEvidenceStates(ctx, s.repo.DB(), []model.BalanceRun{run})
+	if err != nil {
+		return model.BalanceRun{}, err
+	}
+	applyEvidenceState(&run, states[run.ID])
+	return run, nil
 }
 
 func (s *BalanceService) Run(ctx context.Context, request dto.RunBalanceRequest, actor repository.Actor) (model.BalanceRun, error) {
@@ -71,7 +91,7 @@ func (s *BalanceService) Run(ctx context.Context, request dto.RunBalanceRequest,
 	if err != nil {
 		return model.BalanceRun{}, err
 	}
-	calculation, snapshotJSON, evidenceJSON, err := calculateBalanceRun(tank, opening, closing, transfers, start, end)
+	calculation, snapshotJSON, evidenceJSON, frozenManifestJSON, err := calculateBalanceRun(tank, opening, closing, transfers, start, end)
 	if err != nil {
 		return model.BalanceRun{}, err
 	}
@@ -92,6 +112,9 @@ func (s *BalanceService) Run(ctx context.Context, request dto.RunBalanceRequest,
 		DeviationPct:       calculation.DeviationPct,
 		DeviationLevel:     calculation.DeviationLevel,
 		CoefficientVersion: tank.CoefficientVersion,
+		FrozenEvidenceJSON: datatypes.JSON(frozenManifestJSON),
+		EvidenceStale:      false,
+		StaleReasonsJSON:   datatypes.JSON([]byte("[]")),
 		Version:            2,
 		CreatedBy:          actor.UserID,
 	}
@@ -99,6 +122,12 @@ func (s *BalanceService) Run(ctx context.Context, request dto.RunBalanceRequest,
 		return model.BalanceRun{}, err
 	}
 	run.Tank = &tank
+	manifest, _, manifestErr := model.ParseFrozenManifest(run.FrozenEvidenceJSON)
+	if manifestErr != nil {
+		return model.BalanceRun{}, manifestErr
+	}
+	run.FrozenManifest = &manifest
+	run.StaleChanges = []model.EvidenceChange{}
 	return run, nil
 }
 
@@ -121,7 +150,7 @@ type balanceEvidence struct {
 	SafetyBoundary   string                   `json:"safety_boundary"`
 }
 
-func calculateBalanceRun(tank model.StorageTank, opening, closing model.MeasurementSnapshot, transfers []model.TransferOperation, start, end time.Time) (calculatedBalance, []byte, []byte, error) {
+func calculateBalanceRun(tank model.StorageTank, opening, closing model.MeasurementSnapshot, transfers []model.TransferOperation, start, end time.Time) (calculatedBalance, []byte, []byte, []byte, error) {
 	inflows, outflows := make([]float64, 0), make([]float64, 0)
 	uncertaintyInputs := []balance.UncertaintyInput{
 		{Source: "opening_snapshot", EntityID: opening.ID, MassKG: opening.CalculatedLiquidMassKG, UncertaintyPct: opening.MeasurementUncertaintyPct},
@@ -147,15 +176,15 @@ func calculateBalanceRun(tank model.StorageTank, opening, closing model.Measurem
 	}
 	net, err := balance.NetTransfer(inflows, outflows)
 	if err != nil {
-		return calculatedBalance{}, nil, nil, fmt.Errorf("calculate net transfer: %w", err)
+		return calculatedBalance{}, nil, nil, nil, fmt.Errorf("calculate net transfer: %w", err)
 	}
 	deviation, err := balance.PhysicalBalance(opening.CalculatedLiquidMassKG, net, closing.CalculatedLiquidMassKG)
 	if err != nil {
-		return calculatedBalance{}, nil, nil, fmt.Errorf("calculate physical mass balance: %w", err)
+		return calculatedBalance{}, nil, nil, nil, fmt.Errorf("calculate physical mass balance: %w", err)
 	}
 	propagated, err := balance.PropagateUncertainty(uncertaintyInputs)
 	if err != nil {
-		return calculatedBalance{}, nil, nil, fmt.Errorf("propagate measurement uncertainty: %w", err)
+		return calculatedBalance{}, nil, nil, nil, fmt.Errorf("propagate measurement uncertainty: %w", err)
 	}
 	for index := range components {
 		components[index].AbsoluteKG = propagated.Components[index]
@@ -193,11 +222,21 @@ func calculateBalanceRun(tank model.StorageTank, opening, closing model.Measurem
 	}
 	snapshotJSON, err := json.Marshal(inputSnapshot)
 	if err != nil {
-		return calculatedBalance{}, nil, nil, fmt.Errorf("marshal immutable balance input snapshot: %w", err)
+		return calculatedBalance{}, nil, nil, nil, fmt.Errorf("marshal immutable balance input snapshot: %w", err)
 	}
 	evidenceJSON, err := json.Marshal(evidence)
 	if err != nil {
-		return calculatedBalance{}, nil, nil, fmt.Errorf("marshal balance evidence: %w", err)
+		return calculatedBalance{}, nil, nil, nil, fmt.Errorf("marshal balance evidence: %w", err)
+	}
+	// 计算时固化期初、期末快照和期间已确认转移的摘要指纹，
+	// 后续读取与状态迁移都基于该清单重放校验，旧结果永不被覆盖。
+	manifest, err := model.BuildFrozenManifest(opening, closing, transfers, start, end, time.Now().UTC())
+	if err != nil {
+		return calculatedBalance{}, nil, nil, nil, fmt.Errorf("build frozen evidence manifest: %w", err)
+	}
+	frozenManifestJSON, err := model.MarshalFrozenManifest(manifest)
+	if err != nil {
+		return calculatedBalance{}, nil, nil, nil, fmt.Errorf("marshal frozen evidence manifest: %w", err)
 	}
 	return calculatedBalance{
 		OpeningMassKG:   opening.CalculatedLiquidMassKG,
@@ -209,14 +248,18 @@ func calculateBalanceRun(tank model.StorageTank, opening, closing model.Measurem
 		IntervalUpperKG: upper,
 		DeviationPct:    balance.DeviationPercent(deviation, opening.CalculatedLiquidMassKG),
 		DeviationLevel:  level,
-	}, snapshotJSON, evidenceJSON, nil
+	}, snapshotJSON, evidenceJSON, frozenManifestJSON, nil
 }
 
 func (s *BalanceService) Submit(ctx context.Context, id uint, request dto.SubmitBalanceRequest, actor repository.Actor) (model.BalanceRun, error) {
 	if !constants.CanAnalyze(actor.Role) {
 		return model.BalanceRun{}, api.ErrForbidden
 	}
-	return s.repo.Transition(ctx, id, request.Version, constants.BalancePendingReview, "提交独立复核", nil, actor)
+	updated, err := s.repo.Transition(ctx, id, request.Version, constants.BalancePendingReview, "提交独立复核", nil, actor)
+	if err != nil {
+		return model.BalanceRun{}, err
+	}
+	return s.loadEvidenceView(ctx, updated)
 }
 
 func (s *BalanceService) Review(ctx context.Context, id uint, request dto.ReviewBalanceRequest, actor repository.Actor) (model.BalanceRun, error) {
@@ -227,7 +270,11 @@ func (s *BalanceService) Review(ctx context.Context, id uint, request dto.Review
 		return model.BalanceRun{}, api.NewError(422, "INVALID_REVIEW_DECISION", "复核目标状态只能是 accepted 或 rejected")
 	}
 	note := strings.TrimSpace(request.ReviewNote)
-	return s.repo.Transition(ctx, id, request.Version, request.TargetStatus, note, &actor.UserID, actor)
+	updated, err := s.repo.Transition(ctx, id, request.Version, request.TargetStatus, note, &actor.UserID, actor)
+	if err != nil {
+		return model.BalanceRun{}, err
+	}
+	return s.loadEvidenceView(ctx, updated)
 }
 
 func (s *BalanceService) Invalidate(ctx context.Context, id uint, request dto.InvalidateBalanceRequest, actor repository.Actor) (model.BalanceRun, error) {
@@ -235,7 +282,41 @@ func (s *BalanceService) Invalidate(ctx context.Context, id uint, request dto.In
 		return model.BalanceRun{}, api.ErrForbidden
 	}
 	note := strings.TrimSpace(request.Reason)
-	return s.repo.Transition(ctx, id, request.Version, constants.BalanceInvalidated, note, &actor.UserID, actor)
+	updated, err := s.repo.Transition(ctx, id, request.Version, constants.BalanceInvalidated, note, &actor.UserID, actor)
+	if err != nil {
+		return model.BalanceRun{}, err
+	}
+	return s.loadEvidenceView(ctx, updated)
+}
+
+// loadEvidenceView 为重算/迁移后的运行附加实时证据冻结视图，保持响应字段与列表一致。
+func (s *BalanceService) loadEvidenceView(ctx context.Context, run model.BalanceRun) (model.BalanceRun, error) {
+	states, err := repository.LoadEvidenceStates(ctx, s.repo.DB(), []model.BalanceRun{run})
+	if err != nil {
+		return model.BalanceRun{}, err
+	}
+	applyEvidenceState(&run, states[run.ID])
+	return run, nil
+}
+
+// applyEvidenceState 合并冻结清单与变化来源到响应模型。
+// 非终态运行的过期状态取实时重放结果（兼容落库标记），终态运行只展示冻结时的历史标记。
+func applyEvidenceState(run *model.BalanceRun, state repository.EvidenceState) {
+	if state.Frozen {
+		manifest := state.Manifest
+		run.FrozenManifest = &manifest
+	} else {
+		run.FrozenManifest = nil
+	}
+	if state.Realtime {
+		run.EvidenceStale = run.EvidenceStale || len(state.Changes) > 0
+	} else if run.BalanceStatus != constants.BalanceInvalidated {
+		run.EvidenceStale = false
+	}
+	run.StaleChanges = state.Changes
+	if run.StaleChanges == nil {
+		run.StaleChanges = []model.EvidenceChange{}
+	}
 }
 
 func (s *BalanceService) Uncertainty(ctx context.Context, id uint) (dto.UncertaintyBreakdown, error) {

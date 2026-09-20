@@ -40,6 +40,25 @@ func CanTransitionBalance(from, to BalanceStatus) bool {
 	}
 }
 
+// EvidenceGuardedStatuses 是仍受证据冻结校验约束的非终态状态：
+// 期间证据变化时这些运行会被标记过期，且过期后不得提交或复核。
+// accepted 与 invalidated 为终态，冻结清单只作不可变历史保留。
+var EvidenceGuardedStatuses = []BalanceStatus{
+	BalanceCalculating,
+	BalancePendingReview,
+	BalanceRejected,
+}
+
+// EvidenceFreezeGuarded 判断指定状态是否参与证据过期标记与提交/复核拦截。
+func EvidenceFreezeGuarded(status BalanceStatus) bool {
+	for _, candidate := range EvidenceGuardedStatuses {
+		if candidate == status {
+			return true
+		}
+	}
+	return false
+}
+
 func BalanceStatusValues() []string {
 	values := make([]string, 0, len(BalanceStatuses))
 	for _, status := range BalanceStatuses {

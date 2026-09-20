@@ -86,6 +86,13 @@ func (r *TransferRepository) Create(ctx context.Context, item *model.TransferOpe
 		if err := tx.Create(&audit).Error; err != nil {
 			return fmt.Errorf("audit transfer operation: %w", err)
 		}
+		// 直接以 confirmed 落库的转移立即进入期间已确认集合，
+		// 同事务重放受影响运行的冻结摘要并标记证据过期。
+		if item.OperationStatus == "confirmed" {
+			if err := markRunsStaleFromTransfer(tx, item.TankID, time.Now().UTC(), actor); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 }
@@ -125,6 +132,13 @@ func (r *TransferRepository) Transition(ctx context.Context, id, version uint, t
 		audit := NewAudit(actor, "transfer_operation."+target, "transfer_operation", id, before, map[string]any{"record": updated, "reason": reason})
 		if err := tx.Create(&audit).Error; err != nil {
 			return fmt.Errorf("audit transfer transition: %w", err)
+		}
+		// draft -> confirmed 会新增期间已确认证据，confirmed -> cancelled 会移除证据，
+		// 两种变化都在同一事务内标记引用该期间的非终态平衡运行证据过期。
+		if target == "confirmed" || target == "cancelled" {
+			if err := markRunsStaleFromTransfer(tx, updated.TankID, time.Now().UTC(), actor); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
